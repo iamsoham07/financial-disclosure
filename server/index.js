@@ -146,8 +146,8 @@ app.post('/api/process', async (req, res) => {
 
     const data = extractData(consentOrder);
     const filledBuffer = Service === 'Assisted'
-      ? fillAssistedTemplate(templateBuffer, data)
-      : fillNegotiationTemplate(templateBuffer, data);
+      ? await fillAssistedTemplate(templateBuffer, data)
+      : await fillNegotiationTemplate(templateBuffer, data);
 
     const resName = data.resName.replace(/[^A-Za-z0-9_-]/g, '_') || 'Unknown';
     const outName = `Financial_Disclosure_${Service}_${resName}_${new Date().toISOString().slice(0, 10)}.xlsx`;
