@@ -97,7 +97,10 @@ function extractData(consentOrder) {
   const resOcc      = d['Matter.Respondent_occupation'] || '';
 
   // Property addresses (for Negotiation column headers)
-  const fmhAddress   = d['Petitioner.Property_address'] || '';
+  // Try the last address together (FMH) first, fall back to current address
+  const raw = d['Petitioner.Last_address_together'] || d['Petitioner.Current_address'] || '{}';
+  const addr = (() => { try { return JSON.parse(raw); } catch { return {}; } })();
+  const fmhAddress   = addr.full_address || addr.address || (typeof raw === 'string' && !raw.startsWith('{') ? raw : '') || d['Petitioner.Property_address'] || '';
   const prop2Address = d['Respondent.Property_address'] || '';
 
   // Children with name + dob (name field name may need adjusting)
@@ -396,8 +399,8 @@ async function fillNegotiationTemplate(templateBuffer, data) {
   const wf = (ref, formula) => ws.cell(ref).formula(formula);
 
   // ── Names & case number ───────────────────────────────────────────────────
-  w('B2', data.petName);
-  w('B3', data.resName);
+  w('B2', data.petFirstName || data.petName);
+  w('B3', data.resFirstName || data.resName);
   w('D3', data.caseNumber ? `${data.caseNumber} - ` : '');
 
   // ── Property address labels ───────────────────────────────────────────────
