@@ -5,6 +5,8 @@ const multer     = require('multer');
 const path       = require('path');
 const { pool, setupDatabase } = require('./db');
 const { extractData, fillAssistedTemplate, fillNegotiationTemplate } = require('./xlsxFiller');
+const fetch    = require('node-fetch');
+const FormData = require('form-data');
 
 const app    = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -154,7 +156,20 @@ app.post('/api/process', async (req, res) => {
 
     await updateLog('success', null, filledBuffer, outName);
 
-    // ── 3. Return the filled xlsx with metadata headers ───────────────────
+    // ── 3. Send filled xlsx to n8n webhook (fire-and-forget) ─────────────
+    const webhookUrl = process.env.N8N_WEBHOOK_URL;
+    if (webhookUrl) {
+      const form = new FormData();
+      form.append('file', filledBuffer, { filename: outName, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      form.append('hs_object_id', String(hs_object_id));
+      form.append('service', Service);
+      form.append('file_name', outName);
+      fetch(webhookUrl, { method: 'POST', body: form, headers: form.getHeaders() })
+        .then(r => console.log(`[n8n] webhook responded ${r.status}`))
+        .catch(e => console.error('[n8n] webhook error:', e.message));
+    }
+
+    // ── 4. Return the filled xlsx with metadata headers ───────────────────
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
     res.setHeader('X-HS-Object-ID', String(hs_object_id));
