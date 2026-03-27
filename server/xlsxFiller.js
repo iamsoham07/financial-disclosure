@@ -457,9 +457,12 @@ async function fillNegotiationTemplate(templateBuffer, data) {
   w('B26', data.petOtherInc);  w('D26', data.resOtherInc);
 
   // ── Net effect — property & capital after (rows 40–50) ───────────────────
-  w('B40', data.fmhValue);              w('D40', 0);
-  w('B41', 0);                          w('D41', data.prop2Value);
-  w('B42', 0);                          w('D42', data.prop3Value - data.prop3Cgt);
+  const fmhEquityNeg  = Math.max(0, data.fmhValue   - data.petMortTotal);
+  const prop2EquityNeg = Math.max(0, data.prop2Value - data.resMortTotal);
+  const prop3Net      = data.prop3Value > 0 ? Math.max(0, data.prop3Value - data.prop3Cgt) : 0;
+  w('B40', fmhEquityNeg);               w('D40', 0);
+  w('B41', 0);                          w('D41', prop2EquityNeg);
+  w('B42', 0);                          w('D42', prop3Net);
   w('B43', 0);                          w('D43', data.prop4Value);
 
   const petOtherNow = data.petBanks + data.petIsas + data.petInvest + data.petVehs + data.petAddAss;
