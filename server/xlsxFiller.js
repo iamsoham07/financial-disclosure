@@ -68,10 +68,11 @@ function getSectionRows(sectionArr, labelField, valueField) {
   return rows;
 }
 
-/** Convert ISO date string to a JS Date, or return null */
+/** Convert ISO date string to a midnight-UTC JS Date (strips any time component), or return null */
 function toDate(iso) {
   if (!iso) return null;
-  const d = new Date(iso);
+  const dateOnly = String(iso).slice(0, 10); // keep "YYYY-MM-DD", discard any "T..." time
+  const d = new Date(dateOnly + 'T00:00:00Z');
   return isNaN(d.getTime()) ? null : d;
 }
 
@@ -80,8 +81,10 @@ function toDate(iso) {
 function extractData(consentOrder) {
   const d = buildLookup(consentOrder);
 
-  const petName = [d['Petitioner.Legal_first_name'] || '', d['Petitioner.Legal_last_name'] || ''].join(' ').trim();
-  const resName = [d['Respondent.Legal_first_name'] || '', d['Respondent.Legal_last_name'] || ''].join(' ').trim();
+  const petFirstName = d['Petitioner.Legal_first_name'] || '';
+  const resFirstName = d['Respondent.Legal_first_name'] || '';
+  const petName = [petFirstName, d['Petitioner.Legal_last_name'] || ''].join(' ').trim();
+  const resName = [resFirstName, d['Respondent.Legal_last_name'] || ''].join(' ').trim();
 
   const petDobIso   = d['Matter.Petitioner_date_of_birth'] || '';
   const resDobIso   = d['Matter.Respondent_date_of_birth'] || '';
@@ -237,7 +240,7 @@ function extractData(consentOrder) {
   const resLumpSum  = num(d['D81.Lump_sum_payable_res'] || d['Respondent.Lump_sum'] || 0);
 
   return {
-    petName, resName, petOcc, resOcc, caseNumber,
+    petName, resName, petFirstName, resFirstName, petOcc, resOcc, caseNumber,
     petDobIso, resDobIso, cohabIso, marriageIso, sepIso, condIso,
     fmhAddress, prop2Address,
     children, childDobs,
@@ -279,9 +282,9 @@ async function fillAssistedTemplate(templateBuffer, data) {
   // wd() sets a Date value; the cell's existing date format in the template is preserved
   const wd = (ref, iso) => { const d = toDate(iso); if (d) ws.cell(ref).value(d); };
 
-  // ── Names ─────────────────────────────────────────────────────────────────
-  w('B5', data.petName);
-  w('C5', data.resName);
+  // ── Names — first name only (template uses =B5 references throughout) ─────
+  w('B5', data.petFirstName);
+  w('C5', data.resFirstName);
 
   // ── Dates ─────────────────────────────────────────────────────────────────
   wd('H3', data.petDobIso);
@@ -301,100 +304,77 @@ async function fillAssistedTemplate(templateBuffer, data) {
     wd(`H${5 + i}`, child.dob);
   });
 
-  // ── Properties — write equity (value minus mortgage) ─────────────────────
-  const fmhMortgage  = data.petMortTotal;                          // FMH mortgage total
-  const fmhEquity    = Math.max(0, data.fmhValue - fmhMortgage);  // net equity
-  w('A6', data.fmhAddress || 'Family Home');
+  // ── Properties — equity (value minus mortgage) only ───────────────────────
+  // Template address labels are already fixed ("Address 1" etc.) — do not overwrite A cells
+  const fmhEquity   = Math.max(0, data.fmhValue - data.petMortTotal);
   w('B6', fmhEquity / 2);
   w('C6', fmhEquity / 2);
 
   const prop2Equity = Math.max(0, data.prop2Value - data.resMortTotal);
-  w('A8', data.prop2Address || 'Property 2');
-  w('B8', 0);
-  w('C8', prop2Equity);
+  w('B9',  0);            // petitioner share of property 2
+  w('C9',  prop2Equity);  // respondent retains property 2
 
-  // ── Other assets — each on its own row, starting at row 17 ───────────────
-  // Pet assets: label in A, value in B; Res assets: label in A, value in C
-  const petAssets = [
-    ...data.petVehRows,
-    ...data.petBankRows,
-    ...data.petIsaRows,
-    ...data.petInvestRows,
-    ...data.petAddRows,
-  ];
-  const resAssets = [
-    ...data.resBankRows,
-    ...data.resIsaRows,
-    ...data.resInvestRows,
-    ...data.resVehRows,
-    ...data.resAddRows,
-    ...data.resBizRows,
-  ];
+  // ── Other assets — fixed rows matching template pre-labelled rows ──────────
+  // Vehicles: row 16
+  w('B16', data.petVehs);
+  w('C16', data.resVehs);
 
-  let assetRow = 17;
-  petAssets.forEach(asset => {
-    w(`A${assetRow}`, asset.label);
-    w(`B${assetRow}`, asset.value);
-    assetRow++;
-  });
-  resAssets.forEach(asset => {
-    w(`A${assetRow}`, asset.label);
-    w(`C${assetRow}`, asset.value);
-    assetRow++;
-  });
+  // Bank accounts: rows 18–20 (up to 3 per party)
+  data.petBankRows.slice(0, 3).forEach((bank, i) => w(`B${18 + i}`, bank.value));
+  data.resBankRows.slice(0, 3).forEach((bank, i) => w(`C${18 + i}`, bank.value));
 
-  // ── Liabilities — each on its own row, starting at row 37 ────────────────
-  let liabRow = 37;
-  [...data.petCCRows, ...data.petLoanRows].forEach(liab => {
-    w(`A${liabRow}`, liab.label);
-    w(`B${liabRow}`, liab.value);
-    liabRow++;
-  });
-  [...data.resTaxLiabRows, ...data.resCCRows, ...data.resLoanRows].forEach(liab => {
-    w(`A${liabRow}`, liab.label);
-    w(`C${liabRow}`, liab.value);
-    liabRow++;
-  });
+  // ISAs: row 21
+  w('B21', data.petIsas);
+  w('C21', data.resIsas);
 
-  // ── Children assets ───────────────────────────────────────────────────────
-  w('F45', data.childBanks);
-  w('F46', data.childIsas);
-  w('G46', data.childAdd);
+  // Shares / investments: row 22
+  w('B22', data.petInvest);
+  w('C22', data.resInvest);
 
-  // ── Pensions — each on its own row, starting at row 51 ───────────────────
-  let penRow = 51;
-  data.petPensionRows.forEach(pen => {
-    w(`A${penRow}`, pen.label);
-    w(`B${penRow}`, pen.value);
-    penRow++;
-  });
-  data.resPensionRows.forEach(pen => {
-    w(`A${penRow}`, pen.label);
-    w(`C${penRow}`, pen.value);
-    penRow++;
-  });
+  // Business assets: row 23
+  w('C23', data.resBiz);
 
-  // ── Income now ────────────────────────────────────────────────────────────
-  w('B66', data.petSalary);     w('C66', data.resSalary);
-  w('B67', data.petBenefits);   w('C67', data.resBenefits);
-  w('B68', data.petStatePen);   w('C68', data.resStatePen);
-  w('B69', data.petPenInc);     w('C69', data.resPenInc);
-  w('B70', data.petBankInt);    w('C70', data.resBankInt);
-  w('B71', data.petOtherInc);   w('C71', data.resOtherInc);
-  w('B72', data.petRental);     w('C72', data.resRental);
-  if (data.petRental || data.resRental) w('D73', 'Rental Income');
+  // Other assets: row 24
+  w('B24', data.petAddAss);
+  w('C24', data.resAddAss);
+
+  // Joint assets: rows 25–26 (car park / other joint — each party gets half)
+  w('B25', data.carParkEach);
+  w('C25', data.carParkEach);
+
+  // ── Liabilities — fixed rows ──────────────────────────────────────────────
+  // Credit cards: row 32
+  w('B32', data.petCreditCards);
+  w('C32', data.resCreditCards);
+
+  // Loans: row 33
+  w('B33', data.petLoans);
+  w('C33', data.resLoans);
+
+  // Tax liability: row 34
+  w('C34', data.resTaxLiab);
+
+  // ── Children assets — rows 37–38 ─────────────────────────────────────────
+  w('F37', data.childBanks);
+  w('G37', data.childIsas);
+  w('F38', data.childAdd);
+
+  // ── Pensions — fixed rows 44–52 (template =SUM(B44:B52) / =SUM(C44:C52)) ─
+  data.petPensionRows.slice(0, 9).forEach((pen, i) => w(`B${44 + i}`, pen.value));
+  data.resPensionRows.slice(0, 9).forEach((pen, i) => w(`C${44 + i}`, pen.value));
+
+  // ── Income now — fixed rows 59–66 ─────────────────────────────────────────
+  w('B59', data.petSalary);    w('C59', data.resSalary);
+  w('B60', data.petBenefits);  w('C60', data.resBenefits);
+  w('B61', data.petStatePen);  w('C61', data.resStatePen);
+  w('B62', data.petPenInc);    w('C62', data.resPenInc);
+  w('B63', data.petBankInt);   w('C63', data.resBankInt);
+  w('B66', data.petRental);    w('C66', data.resRental);
 
   // ── Net effect ────────────────────────────────────────────────────────────
-  // G79/I79: property equity figures
-  w('G79', fmhEquity / 2);
-  w('I79', fmhEquity / 2 + prop2Equity);
-  // G80, G82, G84 are template formulas (=B80 etc.) — left untouched
-  // G86/I86: lump sum
-  w('G86', data.petLumpSum);
-  w('I86', data.resLumpSum);
-  // G90/I90: rental income
-  w('G90', data.petRental);
-  w('I90', data.resRental);
+  // G72/I72 are the only true data inputs; all other G/I cells are template formulas
+  w('G72', fmhEquity / 2);
+  w('I72', fmhEquity / 2 + prop2Equity);
 
   return wb.outputAsync();
 }
@@ -403,9 +383,9 @@ async function fillAssistedTemplate(templateBuffer, data) {
 
 async function fillNegotiationTemplate(templateBuffer, data) {
   const wb = await XlsxPopulate.fromDataAsync(templateBuffer);
-  const SHEET = '2. Assets, Debts & Net Effect ';
-  const ws = wb.sheet(SHEET);
-  if (!ws) throw new Error(`Sheet "${SHEET}" not found`);
+  const allSheets = wb.sheets().map(s => s.name());
+  const ws = wb.sheets().find(s => s.name().trim().startsWith('2.'));
+  if (!ws) throw new Error(`Could not find sheet starting with "2." — available sheets: ${allSheets.map(n => `"${n}"`).join(', ')}`);
 
   const w  = (ref, val) => { if (val !== null && val !== undefined) ws.cell(ref).value(val); };
   const wd = (ref, iso) => { const d = toDate(iso); if (d) ws.cell(ref).value(d); };
