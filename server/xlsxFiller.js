@@ -384,8 +384,11 @@ async function fillAssistedTemplate(templateBuffer, data) {
 async function fillNegotiationTemplate(templateBuffer, data) {
   const wb = await XlsxPopulate.fromDataAsync(templateBuffer);
   const allSheets = wb.sheets().map(s => s.name());
-  const ws = wb.sheets().find(s => s.name().trim().startsWith('2.'));
-  if (!ws) throw new Error(`Could not find sheet starting with "2." — available sheets: ${allSheets.map(n => `"${n}"`).join(', ')}`);
+  const ws = wb.sheets().find(s => {
+    const n = s.name().trim();
+    return n.startsWith('2.') || n.startsWith('Assets, Debts');
+  });
+  if (!ws) throw new Error(`Could not find negotiation sheet — available sheets: ${allSheets.map(n => `"${n}"`).join(', ')}`);
 
   const w  = (ref, val) => { if (val !== null && val !== undefined) ws.cell(ref).value(val); };
   const wd = (ref, iso) => { const d = toDate(iso); if (d) ws.cell(ref).value(d); };
