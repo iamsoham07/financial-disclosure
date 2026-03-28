@@ -146,11 +146,18 @@ function extractData(consentOrder) {
   const petOcc      = d['Matter.Petitioner_occupation'] || '';
   const resOcc      = d['Matter.Respondent_occupation'] || '';
 
-  // FMH address — parse from Petitioner.Current_address JSON
+  // FMH address — full version for Assisted, short "Street. Town" for Negotiation header
+  const _rawPetAddress = d['Petitioner.Current_address'] || '{}';
   const fmhAddress = (() => {
     try {
-      const addr = JSON.parse(d['Petitioner.Current_address'] || '{}');
+      const addr = JSON.parse(_rawPetAddress);
       return [addr.Street, addr.Town, addr.Postcode].filter(Boolean).join(', ');
+    } catch { return ''; }
+  })();
+  const fmhAddressShort = (() => {
+    try {
+      const addr = JSON.parse(_rawPetAddress);
+      return [addr.Street, addr.Town].filter(Boolean).join('. ');
     } catch { return ''; }
   })();
 
@@ -165,13 +172,14 @@ function extractData(consentOrder) {
   // Children
   const childrenSection = d['Children.Children_questions'] || [];
   const children = childrenSection.map(row => {
-    let firstName = '', lastName = '', dob = '';
+    let firstName = '', middleName = '', lastName = '', dob = '';
     for (const f of row) {
-      if (f.field === 'Children.First_name')            firstName = f.payload?.value || '';
-      if (f.field === 'Children.Last_name')             lastName  = f.payload?.value || '';
-      if (f.field === 'Children.Birth_day_first_child') dob       = f.payload?.value || '';
+      if (f.field === 'Children.First_name')            firstName  = f.payload?.value || '';
+      if (f.field === 'Children.Middle_name_child')     middleName = f.payload?.value || '';
+      if (f.field === 'Children.Last_name')             lastName   = f.payload?.value || '';
+      if (f.field === 'Children.Birth_day_first_child') dob        = f.payload?.value || '';
     }
-    return { name: `${firstName} ${lastName}`.trim(), dob };
+    return { name: `${firstName} ${middleName} ${lastName}`.replace(/\s+/g, ' ').trim(), dob };
   });
 
   // Property values
@@ -377,7 +385,7 @@ function extractData(consentOrder) {
   return {
     petName, resName, petFirstName, resFirstName, petOcc, resOcc, caseNumber,
     petDobIso, resDobIso, cohabIso, marriageIso, sepIso, condIso,
-    fmhAddress, prop2Address,
+    fmhAddress, fmhAddressShort, prop2Address,
     children,
     fmhValue, prop2Value, prop3Value, prop4Value, prop3Cgt,
     petMortTotal, resMortTotal, carParkEach, jointAssets,
@@ -508,183 +516,173 @@ async function fillNegotiationTemplate(templateBuffer, data) {
   const w  = (ref, val) => { if (val !== null && val !== undefined) ws.cell(ref).value(val); };
   const wd = (ref, iso) => { const d = toDate(iso); if (d) ws.cell(ref).value(d); };
 
+
   // ── Names — first name only (B2/B3 drive all =B2/=B3 refs throughout) ─────
   w('B2', data.petFirstName || data.petName);
   w('B3', data.resFirstName || data.resName);
   w('D3', data.caseNumber ? `${data.caseNumber} - ` : '');
 
-  // ── Update the "Other assets" sub-table headers with actual names ──────────
+  // ── "Other assets" sub-table headers use first names ─────────────────────
   w('H15', `Other assets - ${data.petFirstName || data.petName}`);
   w('L15', `Other assets - ${data.resFirstName || data.resName}`);
 
   // ── Property address labels ───────────────────────────────────────────────
-  w('H6', data.fmhAddress || 'Family Home');
-  w('L6', data.prop2Address || 'Property 2');
+  // H6 = FMH short address: "Street. Town" format matching Cattell "9 Patterdale Close. Crewe"
+  w('H6', data.fmhAddressShort || data.fmhAddress || 'Family Home');
+  // L6: only overwrite if there is actually a second property
+  if (data.prop2Value > 0) w('L6', data.prop2Address || 'Property 2');
 
-  // ── Property values (J col = FMH, N col = Prop2) ─────────────────────────
-  // J9 = formula =SUM(0.02*J7) in Cattell but blank in new template — write it
-  // N9 = formula =SUM(0.02*N7) already in template — NOT touched
+  // ── Property values ───────────────────────────────────────────────────────
+  // J7=FMH value, J8=FMH mortgage, J9=formula in template (leave), J10=blank
+  // N7/N8 only if there is a real second property
   w('J7', data.fmhValue);
   w('J8', data.petMortTotal);
-  w('J9', data.fmhValue * 0.02);  // costs of sale 2%
-  w('J10', 0);                     // ERP
-
-  w('N7', data.prop2Value);
-  w('N8', data.resMortTotal);
-  // N9 = formula already in template — NOT touched
-  w('N10', 0);                     // CGT on prop2
-
-  // Additional properties
-  if (data.prop3Value > 0) {
-    // Prop3 would need its own sub-table — leave blank for now
+  if (data.prop2Value > 0) {
+    w('N7', data.prop2Value);
+    w('N8', data.resMortTotal);
   }
 
-  // ── Petitioner sole assets ────────────────────────────────────────────────
-  // Banks first, then ISAs, investments, additional — label in H, value in J
-  // Rows 16–29 (template sums J16:J29 → J30 → J48 → B11)
-  const petAssets = [
-    ...data.petBankRows,
-    ...data.petIsaRows,
-    ...data.petInvestRows,
-    ...data.petAddRows,
-  ].filter(a => a.value !== 0).slice(0, 14);
-
-  petAssets.forEach((asset, i) => {
-    w(`H${16 + i}`, asset.label);
-    w(`J${16 + i}`, asset.value);
+  // ── Petitioner sole assets — rows 16–29 ──────────────────────────────────
+  // Cattell order: banks (J col), investments (J col), add. assets (K+J cols), vehicles (K+J cols)
+  let petRow = 16;
+  data.petBankRows.forEach(r => {
+    if (petRow > 29) return;
+    w(`H${petRow}`, r.label);  w(`J${petRow}`, r.value);
+    petRow++;
+  });
+  [...data.petInvestRows, ...data.petIsaRows].forEach(r => {
+    if (petRow > 29) return;
+    w(`H${petRow}`, r.label);  w(`J${petRow}`, r.value);
+    petRow++;
+  });
+  data.petAddRows.forEach(r => {
+    if (petRow > 29) return;
+    w(`H${petRow}`, r.label);  w(`K${petRow}`, r.value);  w(`J${petRow}`, r.value);
+    petRow++;
+  });
+  data.petVehRows.forEach(r => {
+    if (petRow > 29) return;
+    w(`H${petRow}`, r.label);  w(`K${petRow}`, r.value);  w(`J${petRow}`, r.value);
+    petRow++;
   });
 
-  // Vehicles written separately into H/K cols (matching Cattell: H23/K23)
-  // They sit after the bank/ISA/invest rows
-  const petVehStartRow = 16 + petAssets.length;
-  data.petVehRows.slice(0, 29 - petVehStartRow + 1).forEach((veh, i) => {
-    w(`H${petVehStartRow + i}`, veh.label);
-    w(`K${petVehStartRow + i}`, veh.value);  // col K for pet vehicles (per Cattell example)
-    w(`J${petVehStartRow + i}`, veh.value);  // also J so template sum picks it up
+  // ── Respondent sole assets — rows 16–29 ──────────────────────────────────
+  // Cattell order: banks (N col), investments/biz (N col), add. assets (O+N cols), vehicles (O+N cols)
+  let resRow = 16;
+  data.resBankRows.forEach(r => {
+    if (resRow > 29) return;
+    w(`L${resRow}`, r.label);  w(`N${resRow}`, r.value);
+    resRow++;
+  });
+  [...data.resInvestRows, ...data.resIsaRows, ...data.resBizRows].forEach(r => {
+    if (resRow > 29) return;
+    w(`L${resRow}`, r.label);  w(`N${resRow}`, r.value);
+    resRow++;
+  });
+  data.resAddRows.forEach(r => {
+    if (resRow > 29) return;
+    w(`L${resRow}`, r.label);  w(`O${resRow}`, r.value);  w(`N${resRow}`, r.value);
+    resRow++;
+  });
+  data.resVehRows.forEach(r => {
+    if (resRow > 29) return;
+    w(`L${resRow}`, r.label);  w(`O${resRow}`, r.value);  w(`N${resRow}`, r.value);
+    resRow++;
   });
 
-  // Additional items (jewellery, watches etc.) — written into spare rows before vehicles
-  // In Cattell: H21/K21 = wedding ring, H22/K22 = (nothing pet)
-  // These are already captured in petAddRows above if present
-
-  // ── Respondent sole assets ────────────────────────────────────────────────
-  // Label in L, value in N — rows 16–29
-  // Business assets included (Lloyds business etc.)
-  const resAssets = [
-    ...data.resBankRows,
-    ...data.resIsaRows,
-    ...data.resInvestRows,
-    ...data.resBizRows,
-    ...data.resAddRows,
-  ].filter(a => a.value !== 0).slice(0, 14);
-
-  resAssets.forEach((asset, i) => {
-    w(`L${16 + i}`, asset.label);
-    w(`N${16 + i}`, asset.value);
-  });
-
-  // Respondent vehicles — written into L/O cols (per Cattell: L23/O23)
-  const resVehStartRow = 16 + resAssets.length;
-  data.resVehRows.slice(0, 29 - resVehStartRow + 1).forEach((veh, i) => {
-    w(`L${resVehStartRow + i}`, veh.label);
-    w(`O${resVehStartRow + i}`, veh.value);  // col O for res vehicles (per Cattell example)
-    w(`N${resVehStartRow + i}`, veh.value);  // also N so template sum picks it up
-  });
-
-  // Additional items (jewellery, watches etc.) written into L/O spare rows
-  // Already captured in resAddRows above
-
-  // ── Joint assets (rows 34–45, J=pet share, N=res share) ──────────────────
+  // ── Joint assets — rows 34–45 (H+L=label, J=pet share, N=res share) ──────
   data.jointAssets.slice(0, 12).forEach((asset, i) => {
-    w(`H${34 + i}`, asset.label);
-    w(`J${34 + i}`, asset.petShare);
-    w(`N${34 + i}`, asset.resShare);
+    w(`H${34 + i}`, asset.label);  w(`J${34 + i}`, asset.petShare);
+    w(`L${34 + i}`, asset.label);  w(`N${34 + i}`, Math.round(asset.resShare));
   });
 
-  // ── Children assets (R16:R20, summed by R21) ──────────────────────────────
-  const childAssets = [...data.childBankRows, ...data.childIsaRows, ...data.childAddRows];
+  // ── Children assets — P/R cols rows 16–20, only if value > 0 ─────────────
+  const childAssets = [...data.childBankRows, ...data.childIsaRows, ...data.childAddRows]
+    .filter(a => a.value > 0);
   childAssets.slice(0, 5).forEach((a, i) => {
     w(`P${16 + i}`, a.label);
     w(`R${16 + i}`, a.value);
   });
 
-  // ── Income now (B22/D22=salary, B23/D23=benefits, B24/D24=rental, B25=interest) ──
-  w('B22', data.petSalary);    w('D22', data.resSalary);
-  w('B23', data.petBenefits);  w('D23', data.resBenefits);
-  w('B24', data.petRental);    w('D24', data.resRental);
-  w('B25', data.petBankInt);
-  w('B26', data.petOtherInc);  w('D26', data.resOtherInc);
+  // ── Income now — B22/D22=salary, B23/D23=state benefits ─────────────────
+  w('B22', data.petSalary);
+  w('D22', Math.round(data.resSalary));  // Cattell shows 2998 not 2998.35
+  w('B23', data.petBenefits);
+  w('D23', data.resBenefits);
 
-  // ── Petitioner liabilities (H label, J value, rows 51–58) ────────────────
-  // template: J59=SUM(J51:J58) → feeds B14 (=J59)
+  // ── Petitioner liabilities — H=label, J=value, rows 51–58 ───────────────
   let petLiabRow = 51;
-  if (data.petVehFinance > 0 && petLiabRow <= 58) {
-    w(`H${petLiabRow}`, 'Car finance');
+  if (data.petVehFinance > 0) {
+    w(`H${petLiabRow}`, 'Car finance ');
     w(`J${petLiabRow}`, data.petVehFinance);
     petLiabRow++;
   }
-  [...data.petCCRows, ...data.petLoanRows].forEach(liab => {
+  [...data.petCCRows, ...data.petLoanRows].filter(r => r.value > 0).forEach(liab => {
     if (petLiabRow > 58) return;
     w(`H${petLiabRow}`, liab.label);
     w(`J${petLiabRow}`, liab.value);
     petLiabRow++;
   });
 
-  // ── Respondent liabilities (L label, N value, rows 51–58) ────────────────
-  // template: N59=SUM(N51:N58) → feeds D14 (=N59)
+  // ── Respondent liabilities — L=label, N=value, rows 51–58 ───────────────
+  // Order: car finance, then credit cards/loans, then tax last
   let resLiabRow = 51;
-  if (data.resVehFinance > 0 && resLiabRow <= 58) {
-    w(`L${resLiabRow}`, 'Car finance');
+  if (data.resVehFinance > 0) {
+    w(`L${resLiabRow}`, 'Car finance ');
     w(`N${resLiabRow}`, data.resVehFinance);
     resLiabRow++;
   }
-  [...data.resTaxLiabRows, ...data.resCCRows, ...data.resLoanRows].forEach(liab => {
+  [...data.resCCRows, ...data.resLoanRows].forEach(liab => {
     if (resLiabRow > 58) return;
     w(`L${resLiabRow}`, liab.label);
-    w(`N${resLiabRow}`, liab.value);
+    w(`N${resLiabRow}`, Math.round(liab.value));
+    resLiabRow++;
+  });
+  data.resTaxLiabRows.forEach(liab => {
+    if (resLiabRow > 58) return;
+    // Format: "Tax liability Jan 2027 " (extract date from parentheses)
+    const dateMatch = liab.label.match(/\(([^)]+)\)/);
+    const taxLabel = dateMatch ? `Tax liability ${dateMatch[1]} ` : liab.label;
+    w(`L${resLiabRow}`, taxLabel);
+    w(`N${resLiabRow}`, Math.round(liab.value));
     resLiabRow++;
   });
 
-  // ── Pensions (H label, J value, rows 62–68 pet; L label, N value rows 62–68 res) ──
-  // template: J69=SUM(J62:J68) → feeds B16 (=J69)
-  //           N69=SUM(N62:N68) → feeds D16 (=N69)
+  // ── Pensions — H=label, J=value rows 62–68 pet; L=label, N=value rows 62–68 res ──
   data.petPensionRows.slice(0, 7).forEach((pen, i) => {
     w(`H${62 + i}`, pen.label);
     w(`J${62 + i}`, pen.value);
   });
   data.resPensionRows.slice(0, 7).forEach((pen, i) => {
     w(`L${62 + i}`, pen.label);
-    w(`N${62 + i}`, pen.value);
+    w(`N${62 + i}`, Math.round(pen.value));
   });
 
-  // ── Income after (B58/D58=salary, B59/D59=benefits, B60/D60=pension income) ──
-  // NOTE: rows 58-62 are the FUTURE income section in the Cattell template
-  w('B58', data.petSalaryAfter);    w('D58', data.resSalaryAfter);
-  w('B59', data.petBenAfter);       w('D59', data.resBenAfter);
-  w('B60', data.petPenIncAfter);    w('D60', data.resPenIncAfter);
-  w('B61', data.petBankIntAfter);   w('D61', data.resBankIntAfter);
-  w('B62', data.petOtherIncAfter);  w('D62', data.resOtherIncAfter);
+  // ── Income after (future) — only write if non-zero ────────────────────────
+  if (data.petSalaryAfter)  w('B58', data.petSalaryAfter);
+  if (data.resSalaryAfter)  w('D58', data.resSalaryAfter);
+  if (data.petBenAfter)     w('B59', data.petBenAfter);
+  if (data.resBenAfter)     w('D59', data.resBenAfter);
+  if (data.petPenIncAfter)  w('B60', data.petPenIncAfter);
+  if (data.resPenIncAfter)  w('D60', data.resPenIncAfter);
+  if (data.petBankIntAfter) w('B61', data.petBankIntAfter);
+  if (data.resBankIntAfter) w('D61', data.resBankIntAfter);
 
-  // ── Dates (rows 77–80) ────────────────────────────────────────────────────
-  // Row 77 = Petitioner: B77=DOB, C77=age(formula), D77=occupation, E77=event, F77=date
-  // Row 78 = Respondent: B78=DOB, D78=occupation, E78=event, F78=date
-  // Row 79 = Child 1:    A79=name, B79=DOB, E79=event, F79=date
-  // Row 80 = Child 2:    A80=name, B80=DOB, E80=event, F80=date
-  // A77 has =B2 formula in Cattell but is blank in new template — write nothing to A77
+  // ── Dates — rows 77–80 ───────────────────────────────────────────────────
   wd('B77', data.petDobIso);  w('D77', data.petOcc);
   wd('B78', data.resDobIso);  w('D78', data.resOcc);
-  wd('F77', data.cohabIso);
-  wd('F78', data.marriageIso);
-  wd('F79', data.sepIso);
-  wd('F80', data.condIso);
+  w('E77', 'Cohabitation');   wd('F77', data.cohabIso);
+  w('E78', 'Marriage ');      wd('F78', data.marriageIso);
+  w('E79', 'Separation ');    wd('F79', data.sepIso);
+  w('E80', 'CDO application date');
+  if (data.condIso) wd('F80', data.condIso);
 
-  // Children — name in A, DOB in B (rows 79–81)
+  // Children — A=name, B=DOB, rows 79–81
   data.children.slice(0, 3).forEach((child, i) => {
     w(`A${79 + i}`, child.name);
     wd(`B${79 + i}`, child.dob);
   });
 
-  // Commentary
   if (data.commentary) w('B84', data.commentary);
 
   return wb.outputAsync();
