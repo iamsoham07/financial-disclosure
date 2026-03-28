@@ -477,9 +477,9 @@ async function fillAssistedTemplate(templateBuffer, data) {
   wd('L5', data.sepIso);
   wd('L6', data.condIso);
 
-  // Children — name in G5 only (G6/G7 are template labels), DOB in H5-H7
+  // Children — G5 = first name only (template label "Child 1"), DOB in H5-H7
   data.children.slice(0, 3).forEach((child, i) => {
-    if (i === 0) w('G5', child.name);
+    if (i === 0) w('G5', child.name.split(' ')[0]);  // first name only, e.g. "Emma" not "Emma Klepin"
     wd(`H${5 + i}`, child.dob);
   });
 
@@ -509,68 +509,101 @@ async function fillAssistedTemplate(templateBuffer, data) {
     w(`C${8 + i}`, prop.resShare);
   });
 
-  // Other assets — fixed rows matching template pre-labelled rows
-  w('B16', data.petVehs);                                            // Vehicles
-  w('C16', data.resVehs);
-  data.petBankRows.slice(0, 3).forEach((b, i) => w(`B${18+i}`, b.value)); // Banks 18-20
-  data.resBankRows.slice(0, 3).forEach((b, i) => w(`C${18+i}`, b.value));
-  w('B21', data.petIsas);                                            // ISAs
-  w('C21', data.resIsas);
-  w('B22', data.petInvest);                                          // Shares
-  w('C22', data.resInvest);
-  w('C23', data.resBiz);                                             // Business
-  w('B24', data.petAddAss);                                          // Other assets
-  w('C24', data.resAddAss);
-  w('B25', data.jointAssets.reduce((t, a) => t + a.petShare, 0));  // Joint assets — pet share
-  w('C25', data.jointAssets.reduce((t, a) => t + a.resShare, 0)); // Joint assets — res share
+  // Other assets — each item on its own labelled row, matching Bardasu exactly
+  // Template has fixed section headers in col A (Vehicles row 16, Current Accounts row 17,
+  // ISAs/Savings row 21, Shares row 22, Business row 23, Other Assets row 24)
+  // Values go in rows 17-19 for vehicles, 21-25 for banks/joint, 26 for ISAs etc.
 
-  // Liabilities — fixed rows
-  w('B32', data.petCreditCards);
-  w('C32', data.resCreditCards);
-  w('B33', data.petLoans);
-  w('C33', data.resLoans);
-  w('C34', data.resTaxLiab);
-  w('B36', data.petVehFinance);
-  w('C36', data.resVehFinance);
+  // Vehicles — pet in B, res in C, each on own row starting at 17
+  let petVehRow = 17, resVehRow = 17;
+  data.petVehRows.forEach(v => { w(`A${petVehRow}`, v.label); w(`B${petVehRow}`, v.value); petVehRow++; });
+  data.resVehRows.forEach(v => { w(`A${resVehRow}`, v.label); w(`C${resVehRow}`, v.value); resVehRow++; });
 
-  // Children assets — written in F/G columns alongside the liabilities/pension area
-  // Bardasu example: F45="Emma's ISA", F46="Vanguard", G46=18650.34
-  // Pattern: F45 = child name + asset type, F46 = provider name, G46 = value
+  // Bank accounts — pet in B, res in C, each on own row (template has "Current Accounts"
+  // as a section label at row 20 in Bardasu — we start data at row 21)
+  let bankRow = 21;
+  data.petBankRows.forEach(b => { w(`A${bankRow}`, b.label); w(`B${bankRow}`, b.value); bankRow++; });
+  data.resBankRows.forEach(b => { w(`A${bankRow}`, b.label); w(`C${bankRow}`, b.value); bankRow++; });
+
+  // Joint bank accounts — both B and C on same row
+  data.jointAssets.filter(a => !('isLastTogether' in a)).forEach(a => {
+    w(`A${bankRow}`, a.label);
+    w(`B${bankRow}`, a.petShare);
+    w(`C${bankRow}`, a.resShare);
+    bankRow++;
+  });
+
+  // ISAs — totals on row 26 (Bardasu: A26="ISAs/Savings", B26=25044, C26=4875)
+  w('B26', data.petIsas);
+  w('C26', data.resIsas);
+
+  // Investments/Shares — row 27 (A27="Shares" is structural label)
+  w('B27', data.petInvest);
+  w('C27', data.resInvest);
+
+  // Business — row 28 (A28="Business " structural)
+  w('C28', data.resBiz);
+
+  // Other assets — row 29 (A29="Other Assets" structural)
+  w('B29', data.petAddAss);
+  w('C29', data.resAddAss);
+
+  // Liabilities — each on its own labelled row
+  // Credit cards: individual rows starting at 38
+  let petLiabRow = 38, resLiabRow = 38;
+  data.petCCRows.filter(r => r.value > 0).forEach(l => {
+    w(`A${petLiabRow}`, l.label); w(`B${petLiabRow}`, l.value); petLiabRow++;
+  });
+  // Loans: row 40 in Bardasu (A40="Loans" structural, B40=value)
+  const petLoanTotal = data.petLoans;
+  if (petLoanTotal > 0) { w('B40', petLoanTotal); }
+  // Car financing: row 41 (A41="Car Financing" structural, B41=value)
+  if (data.petVehFinance > 0) { w('B41', data.petVehFinance); }
+  // Respondent liabilities — same pattern in C col
+  data.resCCRows.filter(r => r.value > 0).forEach(l => {
+    w(`A${resLiabRow}`, l.label); w(`C${resLiabRow}`, l.value); resLiabRow++;
+  });
+  if (data.resLoans > 0) { w('C40', data.resLoans); }
+  if (data.resVehFinance > 0) { w('C41', data.resVehFinance); }
+  if (data.resTaxLiab > 0) { w('C43', data.resTaxLiab); }
+
+  // Children assets — F/G columns (Bardasu: F45="Emma's ISA", F46="Vanguard", G46=18650.34)
   const childAssets = [...data.childBankRows, ...data.childIsaRows, ...data.childAddRows]
     .filter(a => a.value > 0);
   if (childAssets.length > 0 && data.children.length > 0) {
     const childName = data.children[0]?.name?.split(' ')[0] || 'Child';
-    // F45 = descriptive label e.g. "Emma's ISA"
     w('F45', `${childName}'s ISA`);
-    // Each asset: provider in F, value in G (starting at F46/G46)
     childAssets.slice(0, 5).forEach((asset, i) => {
       w(`F${46 + i}`, asset.label);
       w(`G${46 + i}`, asset.value);
     });
   }
 
-  // Pensions — fixed rows 44-52
+  // Pensions — label in A col, pet value in B, res value in C
+  // Pet pensions start at row 52, res pensions continue below
   data.petPensionRows.slice(0, 9).forEach((p, i) => {
-    w(`A${52 + i}`, p.label);  // label in A col (Bardasu: A52="Pension Bee")
+    w(`A${52 + i}`, p.label);
     w(`B${52 + i}`, p.value);
   });
+  const resPenStartRow = 52 + data.petPensionRows.length;
   data.resPensionRows.slice(0, 9).forEach((p, i) => {
-    const row = 54 + i;  // res starts at 54 (after 2 pet pensions in Bardasu)
-    // Only write label if A col not already used by pet pension
-    if (data.petPensionRows.length <= i) w(`A${row}`, p.label);
-    else w(`A${row}`, p.label);  // overwrite — res label goes in same A col
-    w(`C${row}`, p.value);
+    w(`A${resPenStartRow + i}`, p.label);
+    w(`C${resPenStartRow + i}`, p.value);
   });
 
-  // Income now — fixed rows 66–73 (matching Bardasu: B66=salary, C67=benefits, B73/C73=rental)
-  w('B66', data.petSalary);    w('C66', data.resSalary);    // Earned income
-  w('B67', data.petBenefits);  w('C67', data.resBenefits);  // State benefits
-  w('B68', data.petStatePen);  w('C68', data.resStatePen);  // State pension
-  w('B69', data.petPenInc);    w('C69', data.resPenInc);    // Other pension income
-  w('B70', data.petBankInt);   w('C70', data.resBankInt);   // Interest
-  // B71/C71 = spousal maintenance — leave blank
-  // B72/C72 = child maintenance — leave blank
-  w('B73', data.petRental);    w('C73', data.resRental);    // Other income / rental
+  // Income now — only write values, leave zero-value rows blank (don't write 0)
+  if (data.petSalary)   w('B66', data.petSalary);
+  if (data.resSalary)   w('C66', data.resSalary);
+  if (data.petBenefits) w('B67', data.petBenefits);
+  if (data.resBenefits) w('C67', data.resBenefits);
+  if (data.petStatePen) w('B68', data.petStatePen);
+  if (data.resStatePen) w('C68', data.resStatePen);
+  if (data.petPenInc)   w('B69', data.petPenInc);
+  if (data.resPenInc)   w('C69', data.resPenInc);
+  if (data.petBankInt)  w('B70', data.petBankInt);
+  if (data.resBankInt)  w('C70', data.resBankInt);
+  if (data.petRental)   w('B73', data.petRental);
+  if (data.resRental)   w('C73', data.resRental);
   if (data.petRental || data.resRental) w('D73', 'Rental Income');
 
   // Net effect — G/I cols
@@ -592,13 +625,14 @@ async function fillAssistedTemplate(templateBuffer, data) {
     w('I86', data.resLumpSum);
   }
 
-  // G90/I90: increased rental income after settlement
-  if (data.petRentalAfter > 0 || data.resRentalAfter > 0) {
-    w('G90', data.petRentalAfter || data.petRental);
-    w('I90', data.resRentalAfter || data.resRental);
-  } else {
-    w('G90', data.petRental);
-    w('I90', data.resRental);
+  // G90/I90: rental income after settlement
+  // In Bardasu: G90=1100 (pet keeps BTL rental), I90=1100 (res gets rental too while co-owned)
+  // Use current rental income — petRentalAfter may be higher if pet gains full rental
+  const rentalAfterPet = data.petRentalAfter > 0 ? data.petRentalAfter : data.petRental;
+  const rentalAfterRes = data.resRentalAfter > 0 ? data.resRentalAfter : data.resRental;
+  if (rentalAfterPet || rentalAfterRes) {
+    w('G90', rentalAfterPet);
+    w('I90', rentalAfterRes);
   }
 
   // G91/I91: child maintenance
@@ -606,6 +640,7 @@ async function fillAssistedTemplate(templateBuffer, data) {
     w('G91', data.childMaintAmount);
     w('I91', data.childMaintAmount);
   }
+  // NOTE: I86 = formula =G86 in the template — do NOT write it, leave formula intact
 
   return wb.outputAsync();
 }
