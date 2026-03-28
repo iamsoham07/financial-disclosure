@@ -317,8 +317,6 @@ function extractData(consentOrder) {
   const childAdd   = childAddRows.reduce((t, r) => t + r.value, 0);
 
   // Joint assets — from joint bank accounts (Petitioner.Joint_bank_account_questions)
-  // Each row has: Petitioner.Joint_bank_name, Petitioner.Joint_account_share (pet's share)
-  // The joint account share is written as pet share in J34, res share in N34
   const petJointBankSection = d['Petitioner.Joint_bank_account_questions'] || [];
   const jointBankAssets = petJointBankSection.map(row => {
     let label = '', petShare = 0, totalVal = 0;
@@ -327,22 +325,32 @@ function extractData(consentOrder) {
       if (f.field === 'Petitioner.Joint_account_share') petShare = num(f.payload?.value ?? 0);
       if (f.field === 'Petitioner.Joint_account_overall_value') totalVal = num(f.payload?.value ?? 0);
     }
-    // If no explicit share, split 50/50
     const resShare = petShare !== 0 ? totalVal - petShare : totalVal / 2;
     return { label: label.trim(), petShare, resShare };
   });
 
-  // Also include any property-based joint assets (car park etc.)
+  // Joint property assets — respects tenants-in-common share percentages
+  // Petitioner.Additional_property_joint_common_tenants_share = "35" means pet has 35%, res has 65%
+  // If blank/missing, it's joint tenants (50/50)
   const petJointPropSection = d['Petitioner.Additional_property_list_owned_with_someone_questions'] || [];
   const jointPropAssets = petJointPropSection.map(row => {
-    let label = '', value = 0;
+    let label = '', value = 0, mortgage = 0, petPct = 50, lastTogether = '';
     for (const f of row) {
       if (f.field === 'Petitioner.Additional_property_joint_address') {
         try { const a = JSON.parse(f.payload?.value || '{}'); label = a.Street || ''; } catch { label = ''; }
       }
       if (f.field === 'Petitioner.Additional_property_joint_agreed_valuation') value = num(f.payload?.value ?? 0);
+      if (f.field === 'Petitioner.Additional_property_joint_mortgage_value') mortgage = num(f.payload?.value ?? 0);
+      if (f.field === 'Petitioner.Additional_property_joint_common_tenants_share') {
+        const pct = num(f.payload?.value ?? 0);
+        if (pct > 0) petPct = pct;
+      }
+      if (f.field === 'Petitioner.Additional_property_joint_last_address_together') lastTogether = f.payload?.value || '';
     }
-    return { label, petShare: value / 2, resShare: value / 2 };
+    const equity = Math.max(0, value - mortgage);
+    const petShare = equity * (petPct / 100);
+    const resShare = equity * ((100 - petPct) / 100);
+    return { label, value, mortgage, equity, petShare, resShare, isLastTogether: lastTogether === 'Yes' };
   });
 
   const jointAssets = [...jointBankAssets, ...jointPropAssets];
@@ -379,8 +387,43 @@ function extractData(consentOrder) {
   const resOtherIncAfter = num(d['Respondent.Income_other_sources_after'] || 0);
 
   const commentary  = d['D81.Other_information_CO_main_reason'] || '';
-  const petLumpSum  = num(d['D81.Lump_sum_payable_app'] || d['Petitioner.Lump_sum'] || 0);
-  const resLumpSum  = num(d['D81.Lump_sum_payable_res'] || d['Respondent.Lump_sum'] || 0);
+
+  // Lump sum — try D81 fields first, fall back to Agreement.Cash_transfers_amount
+  const cashTransfersAmount = num(d['Agreement.Cash_transfers_amount'] || 0);
+  const cashDirection = d['Agreement.Cash_transfers_who_to_who'] || '';
+  const rawLumpSumApp = num(d['D81.Lump_sum_payable_app'] || 0);
+  const rawLumpSumRes = num(d['D81.Lump_sum_payable_res'] || 0);
+  // If D81 fields not present, derive from Agreement fields
+  let petLumpSum = rawLumpSumApp;
+  let resLumpSum = rawLumpSumRes;
+  if (!petLumpSum && !resLumpSum && cashTransfersAmount) {
+    // "Applicant 1 will pay Applicant 2" → pet pays res
+    if (cashDirection.includes('Applicant 1') && cashDirection.includes('pay')) {
+      petLumpSum = cashTransfersAmount;  // pet pays (negative for pet, positive for res)
+    } else {
+      resLumpSum = cashTransfersAmount;
+    }
+  }
+
+  // Net effect property after — read from D81.Property_addresses_after if available
+  // These give the final property values each party gets after settlement
+  const propAfterSection = d['D81.Property_addresses_after'] || [];
+  let petPropAfter = 0, resPropAfter = 0;
+  for (const row of propAfterSection) {
+    for (const f of row) {
+      if (f.field === 'D81.Property_total_app_after') petPropAfter += num(f.payload?.value ?? 0);
+      if (f.field === 'D81.Property_total_res_after') resPropAfter += num(f.payload?.value ?? 0);
+    }
+  }
+
+  // Child maintenance — from D81 structured fields
+  const childMaintApp = num(d['D81.Child_maintenance_app'] || 0);  // negative = pays out
+  const childMaintRes = num(d['D81.Child_maintenance_res'] || 0);  // positive = receives
+  const childMaintAmount = Math.abs(childMaintRes || childMaintApp);
+
+  // Increased rental after — from Income_other_sources_after if it contains rental
+  const petRentalAfter = num(d['Petitioner.Income_other_sources_after'] || 0);
+  const resRentalAfter = num(d['Respondent.Income_other_sources_after'] || 0);
 
   return {
     petName, resName, petFirstName, resFirstName, petOcc, resOcc, caseNumber,
@@ -406,6 +449,8 @@ function extractData(consentOrder) {
     petSalaryAfter, petBenAfter, petPenIncAfter, petBankIntAfter, petOtherIncAfter,
     resSalaryAfter, resBenAfter, resPenIncAfter, resBankIntAfter, resOtherIncAfter,
     petLumpSum, resLumpSum,
+    petPropAfter, resPropAfter,
+    childMaintAmount, petRentalAfter, resRentalAfter,
     commentary,
   };
 }
@@ -438,13 +483,31 @@ async function fillAssistedTemplate(templateBuffer, data) {
     wd(`H${5 + i}`, child.dob);
   });
 
-  // Properties — write equity (value minus mortgage)
-  const fmhEquity   = Math.max(0, data.fmhValue - data.petMortTotal);
-  const prop2Equity = Math.max(0, data.prop2Value - data.resMortTotal);
-  w('B6', fmhEquity / 2);
-  w('C6', fmhEquity / 2);
-  w('B9', 0);
-  w('C9', prop2Equity);
+  // Properties — use joint property assets which respect tenants-in-common share %
+  // Joint props are in jointAssets where isLastTogether distinguishes FMH from BTL
+  const jointProps = data.jointAssets.filter(a => 'isLastTogether' in a);
+  const fmhProp    = jointProps.find(p => p.isLastTogether) || null;
+  const otherProps = jointProps.filter(p => !p.isLastTogether);
+
+  // FMH equity — fallback computation if no joint prop found
+  const fmhEquity = fmhProp ? fmhProp.equity : Math.max(0, data.fmhValue - data.petMortTotal);
+
+  // Row 6: FMH
+  if (fmhProp) {
+    w('A6', fmhProp.label || 'Family Home');
+    w('B6', fmhProp.petShare);
+    w('C6', fmhProp.resShare);
+  } else {
+    w('B6', fmhEquity / 2);
+    w('C6', fmhEquity / 2);
+  }
+
+  // Rows 8, 9... other joint properties (BTL etc.) with correct share splits
+  otherProps.slice(0, 3).forEach((prop, i) => {
+    w(`A${8 + i}`, prop.label || `Property ${i + 2}`);
+    w(`B${8 + i}`, prop.petShare);
+    w(`C${8 + i}`, prop.resShare);
+  });
 
   // Other assets — fixed rows matching template pre-labelled rows
   w('B16', data.petVehs);                                            // Vehicles
@@ -470,28 +533,79 @@ async function fillAssistedTemplate(templateBuffer, data) {
   w('B36', data.petVehFinance);
   w('C36', data.resVehFinance);
 
-  // Children assets — rows 37-38
-  const childAssets = [...data.childBankRows, ...data.childIsaRows, ...data.childAddRows];
-  childAssets.slice(0, 2).forEach((a, i) => {
-    w(`F${37+i}`, a.label);
-    w(`G${37+i}`, a.value);
-  });
+  // Children assets — written in F/G columns alongside the liabilities/pension area
+  // Bardasu example: F45="Emma's ISA", F46="Vanguard", G46=18650.34
+  // Pattern: F45 = child name + asset type, F46 = provider name, G46 = value
+  const childAssets = [...data.childBankRows, ...data.childIsaRows, ...data.childAddRows]
+    .filter(a => a.value > 0);
+  if (childAssets.length > 0 && data.children.length > 0) {
+    const childName = data.children[0]?.name?.split(' ')[0] || 'Child';
+    // F45 = descriptive label e.g. "Emma's ISA"
+    w('F45', `${childName}'s ISA`);
+    // Each asset: provider in F, value in G (starting at F46/G46)
+    childAssets.slice(0, 5).forEach((asset, i) => {
+      w(`F${46 + i}`, asset.label);
+      w(`G${46 + i}`, asset.value);
+    });
+  }
 
   // Pensions — fixed rows 44-52
-  data.petPensionRows.slice(0, 9).forEach((p, i) => w(`B${44+i}`, p.value));
-  data.resPensionRows.slice(0, 9).forEach((p, i) => w(`C${44+i}`, p.value));
+  data.petPensionRows.slice(0, 9).forEach((p, i) => {
+    w(`A${52 + i}`, p.label);  // label in A col (Bardasu: A52="Pension Bee")
+    w(`B${52 + i}`, p.value);
+  });
+  data.resPensionRows.slice(0, 9).forEach((p, i) => {
+    const row = 54 + i;  // res starts at 54 (after 2 pet pensions in Bardasu)
+    // Only write label if A col not already used by pet pension
+    if (data.petPensionRows.length <= i) w(`A${row}`, p.label);
+    else w(`A${row}`, p.label);  // overwrite — res label goes in same A col
+    w(`C${row}`, p.value);
+  });
 
-  // Income now — fixed rows 59-66
-  w('B59', data.petSalary);    w('C59', data.resSalary);
-  w('B60', data.petBenefits);  w('C60', data.resBenefits);
-  w('B61', data.petStatePen);  w('C61', data.resStatePen);
-  w('B62', data.petPenInc);    w('C62', data.resPenInc);
-  w('B63', data.petBankInt);   w('C63', data.resBankInt);
-  w('B66', data.petRental);    w('C66', data.resRental);
+  // Income now — fixed rows 66–73 (matching Bardasu: B66=salary, C67=benefits, B73/C73=rental)
+  w('B66', data.petSalary);    w('C66', data.resSalary);    // Earned income
+  w('B67', data.petBenefits);  w('C67', data.resBenefits);  // State benefits
+  w('B68', data.petStatePen);  w('C68', data.resStatePen);  // State pension
+  w('B69', data.petPenInc);    w('C69', data.resPenInc);    // Other pension income
+  w('B70', data.petBankInt);   w('C70', data.resBankInt);   // Interest
+  // B71/C71 = spousal maintenance — leave blank
+  // B72/C72 = child maintenance — leave blank
+  w('B73', data.petRental);    w('C73', data.resRental);    // Other income / rental
+  if (data.petRental || data.resRental) w('D73', 'Rental Income');
 
-  // Net effect — G72/I72 are the only inputs; all other G/I are template formulas
-  w('G72', fmhEquity / 2);
-  w('I72', fmhEquity / 2 + prop2Equity);
+  // Net effect — G/I cols
+  // G79/I79: property each party gets AFTER settlement (from D81.Property_addresses_after)
+  // Falls back to computed equity if D81 data not present
+  const petPropAfterVal = data.petPropAfter > 0 ? data.petPropAfter
+    : (fmhProp ? fmhProp.petShare : fmhEquity / 2);
+  const resPropAfterVal = data.resPropAfter > 0 ? data.resPropAfter
+    : (fmhProp ? fmhProp.resShare + (otherProps[0]?.resShare || 0) : fmhEquity / 2);
+  w('G79', petPropAfterVal);
+  w('I79', resPropAfterVal);
+
+  // G86/I86: lump sum payment
+  if (data.petLumpSum > 0) {
+    w('G86', data.petLumpSum);   // pet pays — shown as their side
+    w('I86', data.petLumpSum);   // same amount received by res
+  } else if (data.resLumpSum > 0) {
+    w('G86', data.resLumpSum);
+    w('I86', data.resLumpSum);
+  }
+
+  // G90/I90: increased rental income after settlement
+  if (data.petRentalAfter > 0 || data.resRentalAfter > 0) {
+    w('G90', data.petRentalAfter || data.petRental);
+    w('I90', data.resRentalAfter || data.resRental);
+  } else {
+    w('G90', data.petRental);
+    w('I90', data.resRental);
+  }
+
+  // G91/I91: child maintenance
+  if (data.childMaintAmount > 0) {
+    w('G91', data.childMaintAmount);
+    w('I91', data.childMaintAmount);
+  }
 
   return wb.outputAsync();
 }
