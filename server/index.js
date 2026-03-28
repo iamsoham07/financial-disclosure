@@ -14,7 +14,6 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-
 // ─── LAZY DB INIT (safe for serverless cold starts) ─────────────────────────
 let _dbReady = null;
 const ensureDb = () => { if (!_dbReady) _dbReady = setupDatabase(); return _dbReady; };
@@ -91,6 +90,45 @@ app.get('/api/templates/:service/download', async (req, res) => {
   }
 });
 
+// ─── N8N WEBHOOK HELPER ───────────────────────────────────────────────────────
+/**
+ * Sends the filled xlsx to n8n. Awaited — not fire-and-forget — so errors
+ * are caught and logged. Uses a 30 s AbortController timeout.
+ */
+async function sendToN8n(filledBuffer, outName, hs_object_id, Service) {
+  const webhookUrl = process.env.N8N_WEBHOOK_URL;
+  if (!webhookUrl) {
+    console.warn('[n8n] N8N_WEBHOOK_URL not set — skipping webhook');
+    return;
+  }
+
+  const form = new FormData();
+  form.append('file', filledBuffer, {
+    filename:    outName,
+    contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  form.append('hs_object_id', String(hs_object_id));
+  form.append('service',      Service);
+  form.append('file_name',    outName);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const r = await fetch(webhookUrl, {
+      method:  'POST',
+      body:    form,
+      headers: form.getHeaders(),
+      signal:  controller.signal,
+    });
+    const body = await r.text();
+    if (!r.ok) throw new Error(`n8n responded ${r.status}: ${body}`);
+    console.log(`[n8n] webhook OK (${r.status})`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── MAIN PROCESS ENDPOINT ───────────────────────────────────────────────────
 /**
  * POST /api/process
@@ -98,7 +136,8 @@ app.get('/api/templates/:service/download', async (req, res) => {
  *
  * 1. Loads the correct template from Postgres
  * 2. Fills the template with data from consent_order_json
- * 3. Returns the filled xlsx as binary along with hs_object_id and Service headers
+ * 3. Sends the filled xlsx to n8n (awaited, with timeout)
+ * 4. Returns the filled xlsx as binary with metadata headers
  */
 app.post('/api/process', async (req, res) => {
   const { Service, hs_object_id, consent_order_json } = req.body;
@@ -147,29 +186,25 @@ app.post('/api/process', async (req, res) => {
       : consent_order_json;
 
     const data = extractData(consentOrder);
-    const filledBuffer = Service === 'Assisted'
-      ? await fillAssistedTemplate(templateBuffer, data)
-      : await fillNegotiationTemplate(templateBuffer, data);
+    const filledBuffer = await (Service === 'Assisted'
+      ? fillAssistedTemplate(templateBuffer, data)
+      : fillNegotiationTemplate(templateBuffer, data));
 
     const resName = data.resName.replace(/[^A-Za-z0-9_-]/g, '_') || 'Unknown';
     const outName = `Financial_Disclosure_${Service}_${resName}_${new Date().toISOString().slice(0, 10)}.xlsx`;
 
     await updateLog('success', null, filledBuffer, outName);
 
-    // ── 3. Send filled xlsx to n8n webhook (fire-and-forget) ─────────────
-    const webhookUrl = process.env.N8N_WEBHOOK_URL;
-    if (webhookUrl) {
-      const form = new FormData();
-      form.append('file', filledBuffer, { filename: outName, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-      form.append('hs_object_id', String(hs_object_id));
-      form.append('service', Service);
-      form.append('file_name', outName);
-      fetch(webhookUrl, { method: 'POST', body: form, headers: form.getHeaders() })
-        .then(r => console.log(`[n8n] webhook responded ${r.status}`))
-        .catch(e => console.error('[n8n] webhook error:', e.message));
+    // ── 3. Send to n8n (awaited — errors are caught and logged, not fatal) ─
+    try {
+      await sendToN8n(filledBuffer, outName, hs_object_id, Service);
+    } catch (n8nErr) {
+      // n8n failure is non-fatal: log it but still return the file to the caller
+      console.error('[n8n] send failed:', n8nErr.message);
+      await updateLog('success_n8n_failed', n8nErr.message, filledBuffer, outName);
     }
 
-    // ── 4. Return the filled xlsx with metadata headers ───────────────────
+    // ── 4. Return filled xlsx with metadata headers ────────────────────────
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
     res.setHeader('X-HS-Object-ID', String(hs_object_id));
